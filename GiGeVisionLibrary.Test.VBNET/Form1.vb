@@ -15,7 +15,6 @@ Public Class Form1
     ' ——————————————————————————————
     Private cameraService As Camera
     Private streamReceiver = New StreamReceiverParallelOpencv(2)
-    Private imageBuffers() As Bitmap
     Private fpsCounter As Integer
     Private isRecording As Boolean
     Private stopwatch As Stopwatch
@@ -94,14 +93,7 @@ Public Class Form1
     ' Start/Stop Button
     ' ——————————————————————————————
     Private Async Sub btnStart_Click(sender As Object, e As EventArgs) Handles btnStart.Click
-
-        If (cameraService.Width <= 0 OrElse cameraService.Height <= 0) Then
-            'MessageBox.Show("Test")
-            Exit Sub
-        End If
-
         btnStart.Enabled = False
-
         Try
             Dim running = Await StartLiveFeed()
             btnStart.Text = If(running, "Stop", "Start")
@@ -115,12 +107,15 @@ Public Class Form1
         End Try
     End Sub
 
-
     Private Async Function StartLiveFeed() As Task(Of Boolean)
         If Not CameraListLoaded Then Return False
 
         Dim selectedCamera = TryCast(ComboBoxIP.SelectedItem, CameraInformation)
         If selectedCamera Is Nothing Then Return False
+
+        ' Always point the service at the camera the user picked
+        cameraService.IP = selectedCamera.IP
+        cameraService.RxIP = selectedCamera.NetworkIP
 
         ' Toggle stop
         If cameraService.IsStreaming Then
@@ -131,24 +126,16 @@ Public Class Form1
 
         displayCancelTokenSource = New CancellationTokenSource
 
-        ' Safer default if your network isn’t jumbo end-to-end
+        ' Safer default if the network isn’t jumbo end-to-end
         Dim desired = CUInt(nudPacketSize.Value)
         If desired > 1500UI Then desired = 1440UI
         cameraService.Payload = desired
 
-        ' Start stream (this calls SyncParameters internally → Width/Height become valid)
+        ' Start the stream; this syncs parameters so Width/Height become valid
         Dim started = Await cameraService.StartStreamAsync()
         If Not started Then Return False
 
-        ' Allocate AFTER stream start so Width/Height are valid
-        ReDim imageBuffers(streamReceiver.TotalBuffers - 1)
-        For i = 0 To streamReceiver.TotalBuffers - 1
-            imageBuffers(i) = New Bitmap(CInt(cameraService.Width),
-                                     CInt(cameraService.Height),
-                                     Imaging.PixelFormat.Format24bppRgb)
-        Next
-
-        ' Start the processing loop (you had removed this earlier)
+        ' Kick off processing if needed
         If processingThread Is Nothing OrElse Not processingThread.IsAlive Then
             processingThread = New Thread(Sub() ProcessingPipeline(displayCancelTokenSource.Token)) With {
             .IsBackground = True,
@@ -397,16 +384,15 @@ Public Class Form1
     End Function
 
     Private Sub ComboBoxIP_SelectedIndexChanged(sender As Object, e As EventArgs) Handles ComboBoxIP.SelectedIndexChanged
-        If (Not isFormLoaded OrElse cameraService.IP = "") Then
-            Exit Sub
-        End If
+        If ComboBoxIP.SelectedIndex < 0 OrElse camerasList Is Nothing Then Exit Sub
         Try
             cameraService.IP = camerasList(ComboBoxIP.SelectedIndex).IP
             cameraService.RxIP = camerasList(ComboBoxIP.SelectedIndex).NetworkIP
-        Catch ex As Exception
-
+        Catch
+            ' ignore
         End Try
     End Sub
+
 
     Private Sub Form1_Load(sender As Object, e As EventArgs) Handles MyBase.Load
         isFormLoaded = True
