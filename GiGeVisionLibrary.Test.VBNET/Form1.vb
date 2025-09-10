@@ -26,7 +26,8 @@ Public Class Form1
     Private camerasList As List(Of CameraInformation)
     Private displayCancelTokenSource As Threading.CancellationTokenSource
     Public Event FrameReady(bmp As Bitmap)
-
+    ' --- Color handling state ---
+    Private currentBayerConv As ColorConversion = ColorConversion.BayerBg2Bgr
     ' ——————————————————————————————
     ' Constructor / Load
     ' ——————————————————————————————
@@ -38,17 +39,11 @@ Public Class Form1
         nudPacketSize.Maximum = 9000
         nudPacketSize.Value = 9000
         btnStart.Enabled = False
-        PrepCamera()
+        cameraService = New Camera() With {.StreamReceiver = streamReceiver}
+        cameraService.Gvcp.ElapsedOneSecond = AddressOf OnElapsedOneSecond
         btnStart.Enabled = True
     End Sub
 
-    Async Sub PrepCamera()
-        'GigeVision.Core.NetworkService.AllowAppThroughFirewall()
-        cameraService = New Camera() With {.StreamReceiver = streamReceiver}
-        'cameraService.IsMulticast = True
-        cameraService.Gvcp.ElapsedOneSecond = AddressOf OnElapsedOneSecond
-        Await LoadCameraListAsync()
-    End Sub
     ' ——————————————————————————————
     ' Discovering Cameras
     ' ——————————————————————————————
@@ -135,6 +130,19 @@ Public Class Form1
         Dim started = Await cameraService.StartStreamAsync()
         If Not started Then Return False
 
+        'Dim pfName As String = cameraService.PixelFormat.ToString()
+
+        'Dim basePat = BasePatternFromPf(pfName)
+
+        'Dim offX As Integer = CInt((Await cameraService.GetParameterValue("OffsetX")).GetValueOrDefault(0))
+        'Dim offY As Integer = CInt((Await cameraService.GetParameterValue("OffsetY")).GetValueOrDefault(0))
+        'Dim flipX As Boolean = Await cameraService.GetParameterValue("ReverseX").ContinueWith(Function(t) t.Result.GetValueOrDefault(0) <> 0)
+        'Dim flipY As Boolean = Await cameraService.GetParameterValue("ReverseY").ContinueWith(Function(t) t.Result.GetValueOrDefault(0) <> 0)
+
+        'Dim pat = AdjustForParity(basePat, flipX, flipY, offX, offY)
+        'currentBayerConv = ConvFromPatternBGR(pat)
+
+
         ' Kick off processing if needed
         If processingThread Is Nothing OrElse Not processingThread.IsAlive Then
             processingThread = New Thread(Sub() ProcessingPipeline(displayCancelTokenSource.Token)) With {
@@ -183,34 +191,33 @@ Public Class Form1
                 ' Pick the pattern that matches your camera (Rg/Gb/Gr/Bg).
                 ' If it’s Mono8: use Gray2Bgr. If 16-bit: scale to 8-bit first.
                 If src.NumberOfChannels = 1 Then
-                    ' Pick the right Bayer conversion from the pixel format
-                    Dim conv As ColorConversion =
-                    If(cameraService.PixelFormat.ToString().Contains("BayerRG"), ColorConversion.BayerRg2Bgr,
-                    If(cameraService.PixelFormat.ToString().Contains("BayerBG"), ColorConversion.BayerBg2Bgr,
-                    If(cameraService.PixelFormat.ToString().Contains("BayerGB"), ColorConversion.BayerGb2Bgr, ColorConversion.BayerGr2Bgr)))
+                    ' Use the detected pattern
+                    Dim conv As ColorConversion = currentBayerConv
 
                     If src.Depth = DepthType.Cv8U Then
-                        ' 8-bit Bayer → BGR directly
                         CvInvoke.CvtColor(src, colorMat, conv)
                     Else
-                        ' 10/12/16-bit packed in 16-bit container → scale to 8-bit first
+                        ' 10/12/16-bit → scale then demosaic
                         Dim bits As Integer = 16
                         Dim px = cameraService.PixelFormat.ToString()
                         If px.Contains("10") Then bits = 10
                         If px.Contains("12") Then bits = 12
                         If px.Contains("16") Then bits = 16
 
-                        Dim scale As Double = 255.0 / ((1 << bits) - 1)  ' e.g. 0.06226 for 12-bit, 1/256 for 16-bit
-
+                        Dim scale As Double = 255.0 / ((1 << bits) - 1)
                         Using tmp8 As New Mat(src.Rows, src.Cols, DepthType.Cv8U, 1)
-                            ' NOTE: fourth argument is `shift` (use 0)
                             CvInvoke.ConvertScaleAbs(src, tmp8, scale, 0)
                             CvInvoke.CvtColor(tmp8, colorMat, conv)
                         End Using
                     End If
                 Else
-                    ' Already 3-channel; just copy
-                    src.CopyTo(colorMat)
+                    ' 3-channel path: if camera delivers RGB8Packed, convert to BGR for Bitmap
+                    Dim pf = cameraService.PixelFormat.ToString()
+                    If pf.Contains("RGB8") AndAlso Not pf.Contains("BGR") Then
+                        CvInvoke.CvtColor(src, colorMat, ColorConversion.Rgb2Bgr)
+                    Else
+                        src.CopyTo(colorMat)
+                    End If
                 End If
 
 
@@ -224,19 +231,6 @@ Public Class Form1
             End While
         Loop
     End Sub
-
-    Private Function GetBayerConv(fmt As PixelFormat, ByRef is16 As Boolean) As Emgu.CV.CvEnum.ColorConversion?
-
-        Dim s = fmt.ToString() ' e.g. "BayerRG8", "BayerRG12Packed", "Mono8", "RGB8Packed"
-        is16 = s.Contains("10") OrElse s.Contains("12") OrElse s.Contains("16")
-
-        If s.Contains("BayerRG") Then Return Emgu.CV.CvEnum.ColorConversion.BayerRg2Bgr
-        If s.Contains("BayerBG") Then Return Emgu.CV.CvEnum.ColorConversion.BayerBg2Bgr
-        If s.Contains("BayerGB") Then Return Emgu.CV.CvEnum.ColorConversion.BayerGb2Bgr
-        If s.Contains("BayerGR") Then Return Emgu.CV.CvEnum.ColorConversion.BayerGr2Bgr
-
-        Return Nothing ' not a Bayer format
-    End Function
 
     Private Sub SaveXML_Click(sender As Object, e As EventArgs) Handles SaveXML.Click
         cameraService.Gvcp.SaveXmlFileFromCamera(Application.StartupPath)
@@ -257,7 +251,8 @@ Public Class Form1
             Dim paramNames = New List(Of String) From {
                 "ExposureMode",
                 "ExposureAuto",
-                "GainAuto"
+                "GainAuto",
+                "PixelFormat"
             }
 
             ' We'll collect our display strings here
@@ -302,7 +297,7 @@ Public Class Form1
                     End If
                 ElseIf TypeOf cat Is GenICam.GenFloat Then
                     Dim fcat = DirectCast(cat, GenICam.GenFloat)
-                    Dim rawf? As Long = Await fcat.PValue.GetValueAsync()
+                    Dim rawf? As Double = Await fcat.PValue.GetValueAsync()
                     If Not rawf.HasValue Then
                         display(pname) = "<read error>"
                     Else
@@ -312,13 +307,14 @@ Public Class Form1
                     display(pname) = "<unsupported type>"
                 End If
             Next
-            Dim values = If(Not IsNothing(r), $"Gain: {r.GainDb:0.00} dB{vbCrLf}Exposure: {r.ExposureUs:0.##} µs", "")
+            Dim values = If(Not IsNothing(r), $"Gain: {r.GainDB:0.00} dB{vbCrLf}Exposure: {r.ExposureUs:0.##} µs{vbCrLf}", "")
             ' 4) Show them both
             MessageBox.Show(
                 values &
                 $"Exposure Mode : {display("ExposureMode")}{vbCrLf}" &
                 $"Exposure Auto : {display("ExposureAuto")}{vbCrLf}" &
-                $"GainAuto : {display("GainAuto")}{vbCrLf}",
+                $"GainAuto : {display("GainAuto")}{vbCrLf}" &
+                $"PixelFormat : {display("PixelFormat")}{vbCrLf}" &
                 "Camera Features"
               )
         Catch ex As Exception
@@ -383,9 +379,11 @@ Public Class Form1
         End Try
     End Function
 
-    Private Sub ComboBoxIP_SelectedIndexChanged(sender As Object, e As EventArgs) Handles ComboBoxIP.SelectedIndexChanged
-        If ComboBoxIP.SelectedIndex < 0 OrElse camerasList Is Nothing Then Exit Sub
+    Private Async Sub ComboBoxIP_SelectedIndexChanged(sender As Object, e As EventArgs) Handles ComboBoxIP.SelectionChangeCommitted
+        If ComboBoxIP.SelectedIndex < 0 OrElse camerasList Is Nothing OrElse isFormLoaded = False Then Exit Sub
         Try
+            Try : Await cameraService.Gvcp.ReadXmlFileAsync(cameraService.IP) : Catch : End Try
+
             cameraService.IP = camerasList(ComboBoxIP.SelectedIndex).IP
             cameraService.RxIP = camerasList(ComboBoxIP.SelectedIndex).NetworkIP
         Catch
@@ -393,8 +391,65 @@ Public Class Form1
         End Try
     End Sub
 
-
-    Private Sub Form1_Load(sender As Object, e As EventArgs) Handles MyBase.Load
+    Private Async Sub Form1_Load(sender As Object, e As EventArgs) Handles MyBase.Shown
+        Await LoadCameraListAsync()
         isFormLoaded = True
     End Sub
+
+    ' --- helpers ---
+    Private Shared Function BasePatternFromPf(pf As String) As String
+        Dim s = New String((If(pf, "")).Where(Function(c) Char.IsLetter(c)).ToArray()).ToUpperInvariant()
+        If s.Contains("BAYERRG") Then Return "RG"
+        If s.Contains("BAYERGR") Then Return "GR"
+        If s.Contains("BAYERGB") Then Return "GB"
+        If s.Contains("BAYERBG") Then Return "BG"
+        Return "BG" ' safe default
+    End Function
+
+    Private Shared Function AdjustForParity(basePat As String, flipX As Boolean, flipY As Boolean,
+                                        offX As Integer, offY As Integer) As String
+        Dim hx = (offX And 1) Xor If(flipX, 1, 0)   ' horizontal phase toggle
+        Dim hy = (offY And 1) Xor If(flipY, 1, 0)   ' vertical   phase toggle
+        Dim p = basePat
+
+        If hx = 1 AndAlso hy = 0 Then               ' horizontal mirror / odd X offset
+            If p = "RG" Then p = "GR"
+        ElseIf p = "GR" Then
+            p = "RG"
+        ElseIf p = "GB" Then
+            p = "BG"
+        ElseIf p = "BG" Then
+            p = "GB"
+        ElseIf hx = 0 AndAlso hy = 1 Then           ' vertical mirror / odd Y offset
+            If p = "RG" Then
+                p = "GB"
+            End If
+        ElseIf p = "GR" Then
+            p = "BG"
+        ElseIf p = "GB" Then
+            p = "RG"
+        ElseIf p = "BG" Then
+            p = "GR"
+        ElseIf hx = 1 AndAlso hy = 1 Then           ' both axes (180°)
+            If p = "RG" Then p = "BG"
+        ElseIf p = "GR" Then
+            p = "GB"
+        ElseIf p = "GB" Then
+            p = "GR"
+        ElseIf p = "BG" Then
+            p = "RG"
+        End If
+        Return p
+    End Function
+
+    Private Shared Function ConvFromPatternBGR(p As String) As ColorConversion
+        Select Case p
+            Case "RG" : Return ColorConversion.BayerRg2Bgr
+            Case "GR" : Return ColorConversion.BayerGr2Bgr
+            Case "GB" : Return ColorConversion.BayerGb2Bgr
+            Case Else : Return ColorConversion.BayerBg2Bgr
+        End Select
+    End Function
+
+
 End Class
